@@ -1,0 +1,902 @@
+***** DeedsMcE Project File *****
+* If you read this message, you need to install the last version of Deeds! *
+FVR 3
+SYS 2
+CPU 1
+FCK 2
+ROM 6
+RAM 6
+PIA 0
+PIB 1
+PIC 2
+PID 3
+PIE 4
+PIF 5
+PIG 6
+PIH 7
+POA 0
+POB 1
+POC 2
+POD 3
+POE 4
+POF 5
+POG 6
+POH 7
+INT 007 SRC 002 PRT 000 TMD 001 TIN 019 EIN 003 
+INT 006 SRC 002 PRT 000 TMD 001 TIN 019 EIN 003 
+INT 005 SRC 002 PRT 000 TMD 001 TIN 019 EIN 003 
+INT 004 SRC 002 PRT 000 TMD 001 TIN 019 EIN 003 
+INT 003 SRC 002 PRT 000 TMD 001 TIN 019 EIN 003 
+INT 002 SRC 002 PRT 000 TMD 001 TIN 019 EIN 003 
+INT 001 SRC 002 PRT 000 TMD 001 TIN 019 EIN 003 
+INT 000 SRC 002 PRT 000 TMD 001 TIN 019 EIN 003 
+******* Project File END ********
+;======================================================================
+; DMC8 - ULTIMATE XO / Ultimate Tic-Tac-Toe
+; Hardware ports:
+;   IA  00H : input from priority encoder (NOT-gated). 1..9 when pressed, 0 idle.
+;   OA  00H : display W-pin selector. Bits 0..6 = display number. Bit 7 MUST be 1
+;             while writing. Write 00H to disable all W pins after each display.
+;   OE  04H : display column number 0..63.
+;   OF  05H : display column byte (lit pixels).
+;   OG  06H : current block indicator. Bit 4 = enable, bits 0..3 = block number.
+;
+; Display numbering:
+;   00H..50H (0..80)  : 81 playable 8x8 cells.
+;   51H..59H (81..89) : 9 isolated result 8x8 cells, one per small block.
+;   5AH      (90)     : large 64x8 message display.
+;
+; OA selection rule:
+;   OA = display_number OR 80H    (bit 7 set = enable)
+;   After writing:  OUT (OA), 00H  (bit 7 clear = disable)
+;
+; RAM:
+;   8000H..8050H : 81 playable cells.  FF=empty, A0=X, 50=O.
+;   8100H..8108H : 9 block results.    FF=open,  A0=X, 50=O, D0=draw.
+;   9000H        : CURBLK  (0..8, current block number, 1 byte)
+;   9001H        : CURCELL (0..8, last played local cell = next forced block)
+;   9002H..9003H : TMPW  (16-bit temp, used by CELLADDR / CHKBIGWIN)
+;   9004H..9005H : TMPW2 (16-bit temp, used by CHKBIGWIN to save IY)
+;
+; Register D usage (preserved across the whole game except by TOGGLE/CLEAND):
+;   bit 0     : player turn.  0 = X, 1 = O.
+;   bit 1     : draw flag set by CHKSMALLDRAW or CHKBIGDRAW.
+;   bit 2     : win flag set by CHKWIN.
+;   bit 3     : closed-block flag set by CHKBLKCLOSED or CHKCELLOCC.
+;   bits 4..7 : result value.  A (=A0H>>4) for X, 5 (=50H>>4) for O,
+;               D (=D0H>>4) for draw.  Full byte: A0H, 50H, D0H.
+;======================================================================
+
+;------ Port equates --------------------------------------------------
+IA      EQU 00H
+OA      EQU 00H
+OE      EQU 04H
+OF      EQU 05H
+OG      EQU 06H
+
+;------ Game value equates --------------------------------------------
+PLX     EQU 0A0H             ; X marker
+PLO     EQU 050H             ; O marker
+DR      EQU 0D0H             ; draw marker
+EMPTY   EQU 0FFH             ; empty cell
+
+;------ RAM base addresses --------------------------------------------
+CELLBASE EQU 8000H           ; base of 81 playable cells
+RESBASE  EQU 8100H           ; base of 9 block-result cells
+
+;------ RAM variables (scratch area, no overlap with game RAM) --------
+CURBLK  EQU 9000H            ; current block number 0..8 (1 byte)
+CURCELL EQU 9001H            ; last played local cell  0..8 (1 byte)
+TMPW    EQU 9002H            ; 16-bit temp (2 bytes)
+TMPW2   EQU 9004H            ; 16-bit temp (2 bytes)
+
+;------ Display number constants (before OR 80H) ----------------------
+BIGDSP  EQU 05AH             ; 90 decimal = large 64x8 message display
+ISOBASE EQU 051H             ; 81 decimal = first isolated result cell
+
+;======================================================================
+;  RESET / ENTRY POINT
+;======================================================================
+        ORG 0000H
+        JP START
+
+        ORG 0010H
+START:
+        LD SP,0FF00H          ; stack at top of RAM, away from game data
+        LD D,00H              ; X goes first (bit 0 = 0)
+        CALL INIT_VALS        ; clear all cells and results to FFH
+        CALL SHOWPLAYER
+        CALL WRTNEWBLK        ; show "NEW BLK" on large display
+        JP CHOOSE_BLOCK       ; player X picks the opening block
+
+;======================================================================
+;  CHOOSE_BLOCK
+;  Ask the current player to pick any available (open) block 0..8.
+;  "NEW BLK" message must already be showing before entering here.
+;  Stays in this loop until an open block is selected.
+;  Clears the message only when a valid block is confirmed.
+;======================================================================
+        ORG 0100H
+CHOOSE_BLOCK:
+        CALL INPA             ; A = button press decoded to 0..8
+        CALL SETBLOCK         ; CURBLK = A, IY = 8000H + 9*A
+        CALL CHKBLKCLOSED     ; D bit3 = 1 if block result != FFH
+        BIT 3,D
+        JP NZ,CHOOSE_BLOCK    ; closed block: ignore, ask again (message stays)
+        ; Valid block confirmed: now clear the message
+        CALL RMVMSG
+        CALL SHOWBLK          ; light up OG for current block
+        JP PLAY
+
+;======================================================================
+;  PLAY
+;  Ask the current player to pick a local cell 0..8 inside current block.
+;  Stays here until an empty cell is selected.
+;======================================================================
+        ORG 0200H
+PLAY:
+        CALL CLEAND           ; keep only turn bit before each move attempt
+        CALL INPA             ; A = local cell 0..8
+        LD E,A                ; E = selected local cell
+        LD A,E
+        LD (CURCELL),A        ; save for next-block decision
+        CALL CELLADDR         ; HL = IX = address of this cell in game RAM
+        CALL CHKCELLOCC       ; D bit3 = 1 if cell is not EMPTY
+        BIT 3,D
+        JP NZ,PLAY            ; occupied: ask again, NO turn toggle
+
+        ; Cell is empty: write X or O
+        CALL WRITECELL        ; RAM[IX] = A0/50, draw X/O on display
+
+        ; Check small block win
+        CALL CHKWIN           ; D bit2=1 and D bits4..7 = winner if won
+        BIT 2,D
+        JP NZ,SMALL_WIN
+
+        ; No small block win: check draw
+        CALL CHKSMALLDRAW     ; D bit1=1 if all 9 cells filled
+        BIT 1,D
+        JP NZ,SMALL_DRAW
+
+        JP NEXT_AFTER_MOVE
+
+;----------------------------------------------------------------------
+SMALL_WIN:
+        CALL WRBLKRESULT      ; store result in 8100H+block, draw on isolated cell
+        CALL CHKBIGWIN        ; check main 3x3 result grid
+        BIT 2,D
+        JP NZ,GAME_WIN
+        CALL CHKBIGDRAW       ; all 9 block results known and no big winner?
+        BIT 1,D
+        JP NZ,GAME_DRAW
+        JP NEXT_AFTER_MOVE
+
+;----------------------------------------------------------------------
+SMALL_DRAW:
+        ; Build D with draw result in high nibble + draw flag in bit1
+        LD A,D
+        AND 01H               ; keep turn bit
+        OR 02H                ; draw flag
+        OR DR                 ; D0H in high nibble (D0H OR 02H OR turn)
+        LD D,A
+        CALL WRBLKRESULT
+        CALL CHKBIGWIN
+        BIT 2,D
+        JP NZ,GAME_WIN
+        CALL CHKBIGDRAW
+        BIT 1,D
+        JP NZ,GAME_DRAW
+        JP NEXT_AFTER_MOVE
+
+;----------------------------------------------------------------------
+GAME_WIN:
+        CALL WRTWINNER        ; show "X WIN" or "O WIN" on display 90
+        JP STOP
+
+;----------------------------------------------------------------------
+GAME_DRAW:
+        ; Ensure D high nibble contains DR for WRTWINNER
+        LD A,D
+        AND 01H
+        OR 02H
+        OR DR
+        LD D,A
+        CALL WRTWINNER        ; show "DRAW" on display 90
+        JP STOP
+
+;----------------------------------------------------------------------
+STOP:
+        NOP
+        JP STOP               ; halt: spin forever
+
+;======================================================================
+;  NEXT_AFTER_MOVE
+;  Toggle player. The local cell number played becomes the next block.
+;  If that block is already closed, go to CHOOSE_BLOCK mode.
+;  Otherwise go directly to PLAY in that block.
+;======================================================================
+        ORG 0300H
+NEXT_AFTER_MOVE:
+        CALL TOGGLE           ; flip D bit0 (X <-> O)
+        CALL SHOWPLAYER
+        LD A,(CURCELL)        ; A = local cell just played = next block number
+        CALL SETBLOCK         ; CURBLK = A, IY = base of that block
+        CALL CHKBLKCLOSED     ; is that block already finished?
+        BIT 3,D
+        JP NZ,NAM_CHOOSE      ; yes: next player must choose freely
+        ; Target block is still open: go play there directly
+        CALL SHOWBLK
+        JP PLAY
+
+NAM_CHOOSE:
+        CALL WRTNEWBLK        ; show "NEW BLK" before waiting for choice
+        JP CHOOSE_BLOCK
+
+;======================================================================
+;  INPA
+;  Wait for a button press (IA != 0), convert 1..9 -> 0..8.
+;  Wait for release before returning to avoid repeated reads.
+;  Returns A = 0..8.
+;  Modifies: A, E. Does NOT touch D.
+;======================================================================
+        ORG 0900H
+INPA:
+        IN A,(IA)
+        CP 00H
+        JP Z,INPA             ; spin while no button pressed
+        DEC A                 ; convert 1..9 to 0..8
+        LD E,A                ; save result
+INPA_REL:
+        IN A,(IA)             ; wait for button release
+        CP 00H
+        JP NZ,INPA_REL
+        LD A,E
+        RET
+
+;======================================================================
+;  SETBLOCK
+;  Input : A = block number 0..8
+;  Output: CURBLK = A, IY = 8000H + 9*A
+;  Uses BC as loop step (BC = 0009H). Does NOT corrupt D.
+;======================================================================
+        ORG 0920H
+SETBLOCK:
+        LD (CURBLK),A
+        LD IY,CELLBASE
+        CP 00H
+        RET Z                 ; block 0: IY = 8000H, done
+        LD B,00H
+        LD C,09H              ; BC = 9 (step per block)
+        LD A,(CURBLK)         ; reload counter
+SETB_LP:
+        ADD IY,BC             ; IY += 9
+        DEC A
+        JP NZ,SETB_LP
+        RET
+
+;======================================================================
+;  SHOWBLK
+;  Output current block number on OG.
+;  OG value = 10H + block_number (bit4 = enable, bits0..3 = block).
+;======================================================================
+SHOWBLK:
+        LD A,(CURBLK)
+        OR 010H               ; set bit 4
+        OUT (OG),A
+        RET
+
+;======================================================================
+;  CELLADDR
+;  Input : IY = block base address, E = local cell 0..8
+;  Output: HL = IX = 8000H + block*9 + local_cell
+;  Uses TMPW.
+;======================================================================
+CELLADDR:
+        LD (TMPW),IY
+        LD HL,(TMPW)          ; HL = IY
+        LD B,00H
+        LD C,E                ; BC = local cell offset
+        ADD HL,BC             ; HL = cell address
+        LD (TMPW),HL
+        LD IX,(TMPW)          ; IX = same cell address
+        RET
+
+;======================================================================
+;  CHKCELLOCC
+;  Input : HL = cell address
+;  Output: D bit3 = 1 if cell is NOT empty (0FFH)
+;======================================================================
+CHKCELLOCC:
+        RES 3,D
+        LD A,(HL)
+        CP EMPTY
+        RET Z
+        SET 3,D
+        RET
+
+;======================================================================
+;  CHKBLKCLOSED
+;  Input : CURBLK
+;  Output: D bit3 = 1 if result at 8100H+CURBLK is not 0FFH
+;======================================================================
+CHKBLKCLOSED:
+        RES 3,D
+        LD A,(CURBLK)
+        LD H,81H
+        LD L,A
+        LD A,(HL)
+        CP EMPTY
+        RET Z
+        SET 3,D
+        RET
+
+;======================================================================
+;  WRITECELL
+;  Input : HL = cell RAM address (low byte = display number 0..80)
+;          D bit0 = player turn
+;  Action: writes A0H or 50H to RAM, selects OA, draws X or O on display.
+;  OA is cleared after DRAW8 returns.
+;======================================================================
+        ORG 0A00H
+WRITECELL:
+        LD A,L                ; display number = low byte of cell address
+        OR 080H               ; bit 7 = enable W decoder
+        OUT (OA),A            ; select this display cell for writing
+
+        BIT 0,D
+        JP NZ,WRCELL_O
+
+WRCELL_X:
+        LD (HL),PLX           ; mark RAM cell as X
+        LD HL,XPAT
+        CALL DRAW8
+        RET
+
+WRCELL_O:
+        LD (HL),PLO           ; mark RAM cell as O
+        LD HL,OPAT
+        CALL DRAW8
+        RET
+
+;======================================================================
+;  DRAW8
+;  Input : HL = pointer to 8-byte column pattern
+;          OA already set to target display
+;  Action: sends columns 0..7 via OE/OF, then clears OA.
+;======================================================================
+DRAW8:
+        LD B,00H
+DRAW8_LP:
+        LD A,B
+        OUT (OE),A            ; column number
+        LD A,(HL)
+        OUT (OF),A            ; column data
+        INC B
+        INC HL
+        LD A,B
+        CP 08H
+        JP NZ,DRAW8_LP
+        LD A,00H
+        OUT (OA),A            ; disable W pins
+        RET
+
+;======================================================================
+;  DRAW64
+;  Input : HL = pointer to 64-byte column pattern
+;          OA already set to target display
+;  Action: sends columns 0..63 via OE/OF, then clears OA.
+;======================================================================
+DRAW64:
+        LD B,00H
+DRAW64_LP:
+        LD A,B
+        OUT (OE),A
+        LD A,(HL)
+        OUT (OF),A
+        INC B
+        INC HL
+        LD A,B
+        CP 040H               ; 64 columns: 00H..3FH
+        JP NZ,DRAW64_LP
+        LD A,00H
+        OUT (OA),A
+        RET
+
+;======================================================================
+;  CHKWIN
+;  Input : IY = base address of 9-cell block (game cells or result RAM)
+;  Output: D bit2 = 1 and D bits4..7 = PLX or PLO if a winner is found.
+;          DR (0D0H) is explicitly excluded: 3 draws never win.
+;  NOTE: this routine is reused for the main 3x3 result check.
+;======================================================================
+        ORG 0B00H
+CHKWIN:
+        ; Clear flags except turn bit before checking
+        LD A,D
+        AND 01H
+        LD D,A
+
+        CALL CW_012           ; row 0
+        BIT 2,D
+        RET NZ
+        CALL CW_345           ; row 1
+        BIT 2,D
+        RET NZ
+        CALL CW_678           ; row 2
+        BIT 2,D
+        RET NZ
+        CALL CW_036           ; col 0
+        BIT 2,D
+        RET NZ
+        CALL CW_147           ; col 1
+        BIT 2,D
+        RET NZ
+        CALL CW_258           ; col 2
+        BIT 2,D
+        RET NZ
+        CALL CW_048           ; diagonal main
+        BIT 2,D
+        RET NZ
+        CALL CW_246           ; diagonal anti
+        RET
+
+; Each helper loads the first cell of a line.
+; If it is EMPTY or DR, the line cannot be won -> return.
+; Then compare against the other two cells. If all equal -> set win.
+
+CW_012:
+        LD A,(IY+0)
+        CALL CW_GUARD
+        RET Z
+        CP (IY+1)
+        RET NZ
+        CP (IY+2)
+        RET NZ
+        JP CW_SETWINA
+
+CW_345:
+        LD A,(IY+3)
+        CALL CW_GUARD
+        RET Z
+        CP (IY+4)
+        RET NZ
+        CP (IY+5)
+        RET NZ
+        JP CW_SETWINA
+
+CW_678:
+        LD A,(IY+6)
+        CALL CW_GUARD
+        RET Z
+        CP (IY+7)
+        RET NZ
+        CP (IY+8)
+        RET NZ
+        JP CW_SETWINA
+
+CW_036:
+        LD A,(IY+0)
+        CALL CW_GUARD
+        RET Z
+        CP (IY+3)
+        RET NZ
+        CP (IY+6)
+        RET NZ
+        JP CW_SETWINA
+
+CW_147:
+        LD A,(IY+1)
+        CALL CW_GUARD
+        RET Z
+        CP (IY+4)
+        RET NZ
+        CP (IY+7)
+        RET NZ
+        JP CW_SETWINA
+
+CW_258:
+        LD A,(IY+2)
+        CALL CW_GUARD
+        RET Z
+        CP (IY+5)
+        RET NZ
+        CP (IY+8)
+        RET NZ
+        JP CW_SETWINA
+
+CW_048:
+        LD A,(IY+0)
+        CALL CW_GUARD
+        RET Z
+        CP (IY+4)
+        RET NZ
+        CP (IY+8)
+        RET NZ
+        JP CW_SETWINA
+
+CW_246:
+        LD A,(IY+2)
+        CALL CW_GUARD
+        RET Z
+        CP (IY+4)
+        RET NZ
+        CP (IY+6)
+        RET NZ
+        JP CW_SETWINA
+
+; CW_GUARD: called with A = first cell of a line.
+; Returns Z=1 (do not check) if A == EMPTY or A == DR.
+; Returns Z=0 (proceed) otherwise.
+; Does NOT modify D.
+CW_GUARD:
+        CP EMPTY
+        RET Z
+        CP DR
+        RET                   ; Z set if A==DR, clear otherwise
+
+; CW_SETWINA: A = winning value (PLX or PLO).
+; Sets D bit2 = 1 and D bits4..7 = A's high nibble.
+CW_SETWINA:
+        LD E,A                ; save winner value
+        LD A,D
+        AND 01H               ; keep only turn bit
+        OR 04H                ; set win flag (bit2)
+        OR E                  ; merge winner value into high nibble
+        LD D,A
+        RET
+
+;======================================================================
+;  CHKSMALLDRAW
+;  Input : IY = base of current 9-cell block
+;  Output: D bit1 = 1 if all 9 cells are non-empty
+;======================================================================
+        ORG 0C00H
+CHKSMALLDRAW:
+        LD A,D
+        AND 01H
+        LD D,A
+        ; Copy IY to HL for iteration
+        LD (TMPW),IY
+        LD HL,(TMPW)
+        LD B,09H
+CSD_LP:
+        LD A,(HL)
+        CP EMPTY
+        RET Z                 ; found an empty cell: not a draw
+        INC HL
+        DEC B
+        JP NZ,CSD_LP
+        SET 1,D               ; all 9 cells filled: draw
+        RET
+
+;======================================================================
+;  WRBLKRESULT
+;  Input : CURBLK = block 0..8, D bits4..7 = PLX / PLO / DR
+;  Action: stores result in 8100H+block, selects isolated display cell
+;          (81 + block = display 51H..59H with bit7 set = D1H..D9H),
+;          draws X, O, or draw pattern.
+;======================================================================
+        ORG 0D00H
+WRBLKRESULT:
+        LD A,D
+        AND 0F0H              ; isolate result value from high nibble
+        LD E,A                ; E = result (A0H, 50H, or D0H)
+
+        ; Store result in 8100H + block
+        LD A,(CURBLK)
+        LD H,81H
+        LD L,A
+        LD (HL),E
+
+        ; Select isolated result display cell
+        LD A,(CURBLK)
+        ADD A,ISOBASE         ; display number = 81 + block_number
+        OR 080H               ; bit 7 = enable
+        OUT (OA),A
+
+        ; Draw the appropriate pattern
+        LD A,E
+        CP PLX
+        JP Z,WRBR_X
+        CP PLO
+        JP Z,WRBR_O
+        ; Draw result
+        LD HL,DPAT
+        CALL DRAW8
+        RET
+WRBR_X:
+        LD HL,XPAT
+        CALL DRAW8
+        RET
+WRBR_O:
+        LD HL,OPAT
+        CALL DRAW8
+        RET
+
+;======================================================================
+;  CHKBIGWIN
+;  Check main 3x3 grid stored in 8100H..8108H for a winning line.
+;  Preserves IY (saves/restores via TMPW2).
+;  Output: D bit2=1 and D bits4..7 = winner if main game is won.
+;======================================================================
+        ORG 0E00H
+CHKBIGWIN:
+        LD (TMPW2),IY         ; save current IY
+        LD IY,RESBASE         ; IY -> 8100H (9 block results)
+        CALL CHKWIN           ; reuse the same win-check logic
+        LD IY,(TMPW2)         ; restore IY
+        RET
+
+;======================================================================
+;  CHKBIGDRAW
+;  Output: D bit1=1 if all 9 block results are known (none = FFH).
+;  Note: this does NOT require a win. Simply all blocks settled.
+;======================================================================
+        ORG 0E50H
+CHKBIGDRAW:
+        LD A,D
+        AND 01H
+        LD D,A
+        LD HL,RESBASE
+        LD B,09H
+CBD_LP:
+        LD A,(HL)
+        CP EMPTY
+        RET Z                 ; at least one block still open: no global draw
+        INC HL
+        DEC B
+        JP NZ,CBD_LP
+        ; All 9 results are known but no winner: global draw
+        LD A,D
+        AND 01H
+        OR 02H
+        OR DR
+        LD D,A
+        RET
+
+;======================================================================
+;  WRTNEWBLK
+;  Select large display 90 (OA = DAH) and write 64-column "NEW BLK"
+;  message. Does NOT clear OA before sending columns (important!).
+;======================================================================
+        ORG 0F00H
+WRTNEWBLK:
+        LD A,BIGDSP           ; 5AH = 90 decimal
+        OR 080H               ; bit 7 = enable  =>  DAH
+        OUT (OA),A
+        LD HL,MSGNEW
+        CALL DRAW64           ; DRAW64 will clear OA when done
+        RET
+
+;======================================================================
+;  RMVMSG
+;  Clear large display 90 by writing 00H to all 64 columns.
+;======================================================================
+        ORG 0F50H
+RMVMSG:
+        LD A,BIGDSP
+        OR 080H
+        OUT (OA),A
+        LD B,00H
+RMV_LP:
+        LD A,B
+        OUT (OE),A
+        LD A,00H
+        OUT (OF),A
+        INC B
+        LD A,B
+        CP 040H
+        JP NZ,RMV_LP
+        LD A,00H
+        OUT (OA),A
+        RET
+
+;======================================================================
+;  WRTWINNER
+;  Input: D bits4..7 = PLX (=A0H), PLO (=50H), or DR (=D0H)
+;  Selects large display 90 and writes the appropriate 64-column message.
+;======================================================================
+        ORG 1000H
+WRTWINNER:
+        LD A,BIGDSP
+        OR 080H               ; DAH
+        OUT (OA),A
+        LD A,D
+        AND 0F0H              ; isolate result nibble
+        CP PLX
+        JP Z,WWT_X_WIN
+        CP PLO
+        JP Z,WWT_O_WIN
+        ; Draw message
+        LD HL,MSGDRAW
+        CALL DRAW64
+        RET
+WWT_X_WIN:
+        LD HL,MSGXWIN
+        CALL DRAW64
+        RET
+WWT_O_WIN:
+        LD HL,MSGOWIN
+        CALL DRAW64
+        RET
+
+;======================================================================
+;  TOGGLE
+;  Flip D bit0 (player turn). Clears all other D bits first.
+;  Note: win/draw flags should already have been acted on before calling
+;  this. The next move always starts with a CLEAND anyway.
+;======================================================================
+        ORG 1080H
+TOGGLE:
+        LD A,D
+        AND 01H               ; isolate turn bit
+        XOR 01H               ; flip it
+        LD D,A
+        RET
+
+;======================================================================
+;  CLEAND
+;  Keep only turn bit in D (bit0). Clears win, draw, closed flags.
+;======================================================================
+CLEAND:
+        LD A,D
+        AND 01H
+        LD D,A
+        RET
+
+;======================================================================
+;  SHOWPLAYER
+;  Writes X or O pattern to display 91 (OA = DBH).
+;  D bit0 = 0 -> X,  D bit0 = 1 -> O.
+;======================================================================
+        ORG 10C0H
+SHOWPLAYER:
+        LD A,05BH
+        OR 080H               ; 05BH | 80H = DBH
+        OUT (OA),A
+        BIT 0,D
+        JP NZ,SHOWPL_O
+SHOWPL_X:
+        LD HL,XPAT
+        CALL DRAW8
+        RET
+SHOWPL_O:
+        LD HL,OPAT
+        CALL DRAW8
+        RET
+
+;======================================================================
+;  INIT_VALS
+;  Clear game RAM: 81 cells (8000H..8050H) and 9 results (8100H..8108H)
+;  all set to FFH (EMPTY).
+;======================================================================
+        ORG 1100H
+INIT_VALS:
+        LD HL,CELLBASE
+        LD B,051H             ; 81 = 51H cells
+INIT_CELLS:
+        LD (HL),EMPTY
+        INC HL
+        DEC B
+        JP NZ,INIT_CELLS
+
+        LD HL,RESBASE
+        LD B,09H              ; 9 result cells
+INIT_RES:
+        LD (HL),EMPTY
+        INC HL
+        DEC B
+        JP NZ,INIT_RES
+        RET
+
+;======================================================================
+;  PATTERNS AND MESSAGE DATA
+;======================================================================
+        ORG 3000H
+
+; 8x8 pixel patterns for game symbols
+; Columns are stored left-to-right. Bit 7 = top pixel.
+
+XPAT:
+; X shape:  diagonal lines crossing
+        DB 0C3H,066H,03CH,018H,018H,03CH,066H,0C3H
+
+OPAT:
+; O shape:  solid border rectangle
+        DB 0FFH,081H,0BDH,0A5H,0A5H,0BDH,081H,0FFH
+
+DPAT:
+; Draw shape: filled inner square
+        DB 000H,07EH,07EH,07EH,07EH,07EH,07EH,000H
+
+;----------------------------------------------------------------------
+; 64-column messages for the large 64x8 display.
+; Each message is exactly 64 bytes = 8 characters x 8 columns.
+; Characters are simple 5x7 style in 8-column blocks.
+; Orientation: bit 7 = topmost pixel of each column.
+;----------------------------------------------------------------------
+
+; Character bitmaps (8 columns each):
+; N
+GN:     DB 0FFH,006H,00CH,018H,030H,060H,0FFH,000H
+; E
+GE:     DB 0FFH,089H,089H,089H,089H,089H,081H,000H
+; W
+GW:     DB 0FFH,060H,030H,018H,018H,030H,060H,0FFH
+; (space)
+GSP:    DB 000H,000H,000H,000H,000H,000H,000H,000H
+; B
+GB:     DB 0FFH,089H,089H,089H,089H,089H,076H,000H
+; L
+GL:     DB 0FFH,080H,080H,080H,080H,080H,080H,000H
+; K
+GK:     DB 0FFH,018H,024H,042H,042H,000H,000H,000H
+; X (same as XPAT but in the font grid)
+GX:     DB 0C3H,066H,03CH,018H,018H,03CH,066H,0C3H
+; O (same as OPAT but in font grid)
+GO:     DB 07EH,081H,081H,081H,081H,081H,07EH,000H
+; W for WIN
+GW2:    DB 0FFH,060H,030H,018H,018H,030H,060H,0FFH
+; I
+GI:     DB 000H,081H,081H,0FFH,0FFH,081H,081H,000H
+; N for WIN
+GN2:    DB 0FFH,006H,00CH,018H,030H,060H,0FFH,000H
+; D
+GD:     DB 0FFH,081H,081H,081H,081H,042H,03CH,000H
+; R
+GR:     DB 0FFH,009H,009H,009H,019H,029H,0C6H,000H
+; A
+GA:     DB 07EH,011H,011H,011H,011H,011H,07EH,000H
+
+;----------------------------------------------------------------------
+; MSGNEW: "NEW BLK " (8 chars x 8 bytes = 64 bytes)
+;   N E W (sp) B L K (sp)
+;----------------------------------------------------------------------
+MSGNEW:
+        DB 0FFH,006H,00CH,018H,030H,060H,0FFH,000H  ; N
+        DB 0FFH,089H,089H,089H,089H,089H,081H,000H  ; E
+        DB 0FFH,060H,030H,018H,018H,030H,060H,0FFH  ; W
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space)
+        DB 0FFH,089H,089H,089H,089H,089H,076H,000H  ; B
+        DB 0FFH,080H,080H,080H,080H,080H,080H,000H  ; L
+        DB 0FFH,018H,024H,042H,081H,000H,000H,000H  ; K
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space)
+
+;----------------------------------------------------------------------
+; MSGXWIN: "X  WIN  " (X, sp, sp, W, I, N, sp, sp)
+;----------------------------------------------------------------------
+MSGXWIN:
+        DB 0C3H,066H,03CH,018H,018H,03CH,066H,0C3H  ; X
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space)
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space)
+        DB 0FFH,060H,030H,018H,018H,030H,060H,0FFH  ; W
+        DB 000H,081H,081H,0FFH,0FFH,081H,081H,000H  ; I
+        DB 0FFH,006H,00CH,018H,030H,060H,0FFH,000H  ; N
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space)
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space)
+
+;----------------------------------------------------------------------
+; MSGOWIN: "O  WIN  "
+;----------------------------------------------------------------------
+MSGOWIN:
+        DB 07EH,081H,081H,081H,081H,081H,07EH,000H  ; O
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space)
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space)
+        DB 0FFH,060H,030H,018H,018H,030H,060H,0FFH  ; W
+        DB 000H,081H,081H,0FFH,0FFH,081H,081H,000H  ; I
+        DB 0FFH,006H,00CH,018H,030H,060H,0FFH,000H  ; N
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space)
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space)
+
+;----------------------------------------------------------------------
+; MSGDRAW: "DRAW    " (D, R, A, W, sp, sp, sp, sp)
+;----------------------------------------------------------------------
+MSGDRAW:
+        DB 0FFH,081H,081H,081H,081H,042H,03CH,000H  ; D
+        DB 0FFH,009H,009H,009H,019H,029H,0C6H,000H  ; R
+        DB 07EH,011H,011H,011H,011H,011H,07EH,000H  ; A
+        DB 0FFH,060H,030H,018H,018H,030H,060H,0FFH  ; W
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space)
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space)
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space)
+        DB 000H,000H,000H,000H,000H,000H,000H,000H  ; (space);

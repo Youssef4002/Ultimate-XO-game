@@ -1,0 +1,2 @@
+when the rectangular cell shows "NEW BLK", the push buttons are used to choose one of the 9 blocks to play in it.
+If it don't show it, the push button are used to play in a block (where there is a '1'), the pushed button goes to the relative (same location) and the processor put the letter (X O) player in the necessary cell.
